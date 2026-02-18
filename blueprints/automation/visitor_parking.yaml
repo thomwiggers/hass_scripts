@@ -1,0 +1,280 @@
+blueprint:
+  name: Visitor Parking – register on arrival
+  description: >
+    Sends an actionable notification to register a visitor's car for paid
+    parking via the City Visitor Parking integration.
+
+    Triggers when a known visitor's device connects to the network (device
+    tracker → home), and also polls every 5 minutes so a notification is sent
+    when the paid window approaches (configurable lead time) while a visitor is
+    already present. Skips the notification if the visitor's car is already
+    registered.
+
+    Fixed settings (edit the automation after import to change):
+      - Lead time before paid window: 30 minutes
+      - Earliest hour for notifications: 07:00
+      - End-of-window buffer: configurable (default 15 minutes before window closes)
+      - Notification wait timeout: 30 minutes
+
+  domain: automation
+
+  input:
+    parking_device:
+      name: Parking device
+      description: The City Visitor Parking device to use.
+      selector:
+        device:
+          integration: city_visitor_parking
+
+    availability_sensor:
+      name: Zone availability sensor
+      description: >
+        Sensor that indicates whether the parking zone is currently in a paid
+        period. Expected states: "chargeable" or "free".
+      selector:
+        entity:
+          domain: sensor
+          integration: city_visitor_parking
+
+    start_sensor:
+      name: Paid window start sensor
+      description: >
+        Timestamp sensor for the start of the current or next paid parking
+        window.
+      selector:
+        entity:
+          domain: sensor
+          device_class: timestamp
+          integration: city_visitor_parking
+
+    end_sensor:
+      name: Paid window end sensor
+      description: >
+        Timestamp sensor for the end of the current or next paid parking
+        window.
+      selector:
+        entity:
+          domain: sensor
+          device_class: timestamp
+          integration: city_visitor_parking
+
+    notify_service:
+      name: Notification service
+      description: >
+        Full name of the notification service, e.g.
+        notify.mobile_app_your_phone
+      selector:
+        text: {}
+
+    visitor_trackers:
+      name: Visitor device trackers
+      description: >
+        Device trackers of your visitors (e.g. via UniFi or GPS companion
+        app). A notification is sent as soon as one of these appears at home.
+      selector:
+        entity:
+          domain: device_tracker
+          multiple: true
+
+    end_buffer_minutes:
+      name: End-of-window buffer
+      description: >
+        The reservation will end this many minutes before the paid window
+        closes, to avoid accidentally running over.
+      default: 15
+      selector:
+        number:
+          min: 0
+          max: 60
+          unit_of_measurement: min
+
+    filter_license_plates:
+      name: License plates to offer
+      description: >
+        List of license plates (as stored in the integration's favorites) to
+        show as choices in the notification. Leave empty ([]) to show all
+        favorites. Matching is case-insensitive and ignores dashes and spaces.
+        Example:
+          - AB-12-CD
+          - EF-34-GH
+      default: []
+      selector:
+        object: {}
+
+mode: single
+
+trigger:
+  # Visitor device connects to the network
+  - platform: state
+    entity_id: !input visitor_trackers
+    to: home
+    for: "00:01:00"
+    id: visitor_arrived
+
+  # Poll every 5 minutes; window proximity check happens in the action
+  - platform: time_pattern
+    minutes: "/5"
+    id: window_check
+
+action:
+  # Make all inputs available as template variables
+  - variables:
+      parking_device: !input parking_device
+      filter_license_plates: !input filter_license_plates
+      visitor_trackers: !input visitor_trackers
+      availability_sensor: !input availability_sensor
+      start_sensor: !input start_sensor
+      end_sensor: !input end_sensor
+      end_buffer_minutes: !input end_buffer_minutes
+
+  # For the periodic check: only continue if the paid window is approaching
+  # (within 30 minutes) and at least one visitor is home
+  - if:
+      - condition: template
+        value_template: "{{ trigger.id == 'window_check' }}"
+    then:
+      - if:
+          - condition: template
+            value_template: >-
+              {% set start = as_datetime(states(start_sensor)) %}
+              {% set window_approaching = now() >= start - timedelta(minutes=30)
+                                         and now() < start %}
+              {% set ns = namespace(visitor_home=false) %}
+              {% for tracker in visitor_trackers %}
+                {% if states(tracker) == 'home' %}{% set ns.visitor_home = true %}{% endif %}
+              {% endfor %}
+              {{ not (window_approaching and ns.visitor_home) }}
+        then:
+          - stop: "Window not approaching or no visitor home"
+
+  # Only run if the paid window is active or still coming today (after 07:00)
+  - condition: template
+    value_template: >-
+      {{ is_state(availability_sensor, 'chargeable') or
+         (now().hour >= 7 and as_datetime(states(start_sensor)) > now()) }}
+
+  # Fetch favorites from the integration
+  - action: city_visitor_parking.list_favorites
+    data:
+      device_id: "{{ parking_device }}"
+    response_variable: favorites_response
+    alias: Fetch favorites
+
+  # Calculate end time and apply license plate filter
+  - variables:
+      end_time: >-
+        {{ (as_datetime(states(end_sensor)) - timedelta(minutes=end_buffer_minutes)).isoformat() }}
+      end_time_local: >-
+        {{ (as_datetime(states(end_sensor)) | as_local - timedelta(minutes=end_buffer_minutes)).strftime('%H:%M') }}
+      favorites: >-
+        {% set all = favorites_response.favorites %}
+        {% if filter_license_plates | length > 0 %}
+          {% set norm_filter = filter_license_plates
+              | map('upper') | map('replace', '-', '') | map('replace', ' ', '') | list %}
+          {% set ns = namespace(filtered=[]) %}
+          {% for fav in all %}
+            {% set norm = fav.license_plate | upper | replace('-', '') | replace(' ', '') %}
+            {% if norm in norm_filter %}
+              {% set ns.filtered = ns.filtered + [fav] %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.filtered }}
+        {% else %}
+          {{ all }}
+        {% endif %}
+
+  # Stop if no (filtered) favorites are available
+  - if:
+      - condition: template
+        value_template: "{{ favorites | length == 0 }}"
+    then:
+      - action: "{{ notify_service }}"
+        data:
+          title: "Visitor parking"
+          message: >-
+            No license plates available to register. Check the favorites and
+            the filter setting.
+      - stop: "No (filtered) favorites found"
+
+  # Fetch active reservations
+  - action: city_visitor_parking.list_active_reservations
+    data:
+      device_id: "{{ parking_device }}"
+    response_variable: reservations_response
+    alias: Fetch active reservations
+
+  # Stop if a visitor's car is already registered
+  - variables:
+      visitor_plates: >-
+        {{ favorites | map(attribute='license_plate')
+                     | map('upper') | map('replace', '-', '') | map('replace', ' ', '')
+                     | list }}
+      registered_plates: >-
+        {{ reservations_response.active_reservations
+           | map(attribute='license_plate')
+           | map('upper') | map('replace', '-', '') | map('replace', ' ', '')
+           | list }}
+      already_registered: >-
+        {{ visitor_plates | select('in', registered_plates) | list | length > 0 }}
+
+  - if:
+      - condition: template
+        value_template: "{{ already_registered }}"
+    then:
+      - stop: "Visitor car already registered"
+
+  # Send notification with one button per favorite
+  - action: "{{ notify_service }}"
+    data:
+      title: "Visitor parking"
+      message: "Register parking until {{ end_time_local }}. Which car?"
+      data:
+        tag: cvp_register
+        actions: >-
+          {% set ns = namespace(acts=[]) %}
+          {% for fav in favorites %}
+            {% set label = fav.get('name') or fav.license_plate %}
+            {% set ns.acts = ns.acts + [{'action': 'CVP_REG_' ~ loop.index0, 'title': label}] %}
+          {% endfor %}
+          {{ ns.acts }}
+    alias: Send choice notification
+
+  # Wait up to 30 minutes for a response
+  - wait_for_trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+    timeout: "00:30:00"
+    continue_on_timeout: false
+    alias: Wait for car choice
+
+  # Register the chosen car
+  - if:
+      - condition: template
+        value_template: >-
+          {{ wait.trigger is defined and
+             wait.trigger.event.data.get('action', '').startswith('CVP_REG_') }}
+    then:
+      - variables:
+          chosen_index: >-
+            {{ wait.trigger.event.data.action | replace('CVP_REG_', '') | int }}
+          chosen_plate: "{{ favorites[chosen_index].license_plate }}"
+          chosen_name: >-
+            {{ favorites[chosen_index].get('name') or favorites[chosen_index].license_plate }}
+
+      - action: city_visitor_parking.start_reservation
+        data:
+          device_id: "{{ parking_device }}"
+          license_plate: "{{ chosen_plate }}"
+          start_time: "{{ now().isoformat() }}"
+          end_time: "{{ end_time }}"
+        alias: Start reservation
+
+      - action: "{{ notify_service }}"
+        data:
+          title: "Visitor parking ✓"
+          message: "{{ chosen_name }} registered until {{ end_time_local }}."
+          data:
+            tag: cvp_register
+        alias: Send confirmation
+    else:
+      - stop: "No valid choice made"

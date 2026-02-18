@@ -1,0 +1,3 @@
+[submodule "integration_code/ha_City-Visitor-Parking"]
+	path = integration_code/ha_City-Visitor-Parking
+	url = https://github.com/sir-Unknown/ha_City-Visitor-Parking
