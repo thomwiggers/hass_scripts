@@ -8,7 +8,7 @@
 set -euo pipefail
 
 VM="${1:-homeassistant}"
-HA_CONFIG="/config"
+HA_CONFIG="/mnt/data/supervisor/homeassistant/"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
