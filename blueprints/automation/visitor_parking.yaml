@@ -60,10 +60,12 @@ blueprint:
 
     notify_services:
       name: Notification services
-      description: One or more notification services to send parking alerts to.
+      description: >
+        One or more notification services to send parking alerts to.
+        Enter the full service name, e.g. notify.mobile_app_your_phone or
+        notify.pushover_thom
       selector:
-        service:
-          domain: notify
+        text:
           multiple: true
 
     visitor_trackers:
