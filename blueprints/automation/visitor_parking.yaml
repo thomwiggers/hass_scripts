@@ -58,13 +58,13 @@ blueprint:
           device_class: timestamp
           integration: city_visitor_parking
 
-    notify_service:
-      name: Notification service
-      description: >
-        Full name of the notification service, e.g.
-        notify.mobile_app_your_phone
+    notify_services:
+      name: Notification services
+      description: One or more notification services to send parking alerts to.
       selector:
-        text: {}
+        service:
+          domain: notify
+          multiple: true
 
     visitor_trackers:
       name: Visitor device trackers
@@ -91,15 +91,13 @@ blueprint:
     filter_license_plates:
       name: License plates to offer
       description: >
-        List of license plates (as stored in the integration's favorites) to
-        show as choices in the notification. Leave empty ([]) to show all
-        favorites. Matching is case-insensitive and ignores dashes and spaces.
-        Example:
-          - AB-12-CD
-          - EF-34-GH
+        License plates (as stored in the integration's favorites) to show as
+        choices in the notification. Leave empty to show all favorites.
+        Matching is case-insensitive and ignores dashes and spaces.
       default: []
       selector:
-        object: {}
+        text:
+          multiple: true
 
 mode: single
 
@@ -126,6 +124,7 @@ action:
       start_sensor: !input start_sensor
       end_sensor: !input end_sensor
       end_buffer_minutes: !input end_buffer_minutes
+      notify_services: !input notify_services
 
   # For the periodic check: only continue if the paid window is approaching
   # (within 30 minutes) and at least one visitor is home
@@ -188,12 +187,15 @@ action:
       - condition: template
         value_template: "{{ favorites | length == 0 }}"
     then:
-      - action: "{{ notify_service }}"
-        data:
-          title: "Visitor parking"
-          message: >-
-            No license plates available to register. Check the favorites and
-            the filter setting.
+      - repeat:
+          for_each: "{{ notify_services }}"
+          sequence:
+            - action: "{{ repeat.item }}"
+              data:
+                title: "Visitor parking"
+                message: >-
+                  No license plates available to register. Check the favorites and
+                  the filter setting.
       - stop: "No (filtered) favorites found"
 
   # Fetch active reservations
@@ -224,19 +226,22 @@ action:
       - stop: "Visitor car already registered"
 
   # Send notification with one button per favorite
-  - action: "{{ notify_service }}"
-    data:
-      title: "Visitor parking"
-      message: "Register parking until {{ end_time_local }}. Which car?"
-      data:
-        tag: cvp_register
-        actions: >-
-          {% set ns = namespace(acts=[]) %}
-          {% for fav in favorites %}
-            {% set label = fav.get('name') or fav.license_plate %}
-            {% set ns.acts = ns.acts + [{'action': 'CVP_REG_' ~ loop.index0, 'title': label}] %}
-          {% endfor %}
-          {{ ns.acts }}
+  - repeat:
+      for_each: "{{ notify_services }}"
+      sequence:
+        - action: "{{ repeat.item }}"
+          data:
+            title: "Visitor parking"
+            message: "Register parking until {{ end_time_local }}. Which car?"
+            data:
+              tag: cvp_register
+              actions: >-
+                {% set ns = namespace(acts=[]) %}
+                {% for fav in favorites %}
+                  {% set label = fav.get('name') or fav.license_plate %}
+                  {% set ns.acts = ns.acts + [{'action': 'CVP_REG_' ~ loop.index0, 'title': label}] %}
+                {% endfor %}
+                {{ ns.acts }}
     alias: Send choice notification
 
   # Wait up to 30 minutes for a response
@@ -269,12 +274,15 @@ action:
           end_time: "{{ end_time }}"
         alias: Start reservation
 
-      - action: "{{ notify_service }}"
-        data:
-          title: "Visitor parking ✓"
-          message: "{{ chosen_name }} registered until {{ end_time_local }}."
-          data:
-            tag: cvp_register
+      - repeat:
+          for_each: "{{ notify_services }}"
+          sequence:
+            - action: "{{ repeat.item }}"
+              data:
+                title: "Visitor parking ✓"
+                message: "{{ chosen_name }} registered until {{ end_time_local }}."
+                data:
+                  tag: cvp_register
         alias: Send confirmation
     else:
       - stop: "No valid choice made"
